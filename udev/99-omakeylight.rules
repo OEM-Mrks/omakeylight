@@ -1,0 +1,13 @@
+# omakeylight — make the keyboard-backlight timeout writable without root.
+#
+# Brightness already works unprivileged through systemd-logind (that is what
+# brightnessctl uses), but `stop_timeout` is a driver-specific attribute with
+# no logind path, so it stays root-only. This hands write access to the wheel
+# group for that one attribute and nothing else.
+#
+# Installed to /etc/udev/rules.d/99-omakeylight.rules by install.sh.
+
+ACTION=="add|change", SUBSYSTEM=="leds", KERNEL=="*kbd_backlight", \
+  TEST=="stop_timeout", \
+  RUN+="/usr/bin/chgrp wheel /sys/class/leds/%k/stop_timeout", \
+  RUN+="/usr/bin/chmod 0664 /sys/class/leds/%k/stop_timeout"

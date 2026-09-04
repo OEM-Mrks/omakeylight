@@ -1,0 +1,22 @@
+{
+  "schemaVersion": 1,
+  "id": "omakeylight.keylight",
+  "name": "omakeylight",
+  "version": "1.0.0",
+  "author": "OEM-Mrks",
+  "description": "Keyboard backlight brightness and auto-off delay from the bar",
+  "homepage": "https://github.com/OEM-Mrks/omakeylight",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Keyboard Light",
+    "description": "Keyboard backlight brightness and auto-off delay",
+    "category": "System",
+    "defaultSection": "right",
+    "allowMultiple": false
+  }
+}

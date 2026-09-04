@@ -1,0 +1,206 @@
+#!/usr/bin/env bash
+#
+# omakeylight-ctl — read and control keyboard-backlight brightness and timeout.
+#
+# Brightness goes through brightnessctl, which talks to systemd-logind and so
+# works unprivileged for the active session. The timeout is a driver-specific
+# sysfs attribute with no logind path; install.sh ships a udev rule that hands
+# write access to the wheel group.
+
+set -uo pipefail
+
+LEDS_DIR=${OMAKEYLIGHT_LEDS_DIR:-/sys/class/leds}
+CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/omakeylight"
+
+# Values the Dell firmware accepts. Other drivers may take a subset; `probe`
+# narrows this list per device and caches the answer.
+CANDIDATE_TIMEOUTS=(5s 10s 30s 1m 5m 15m 1h 12h 1d)
+
+die() { printf 'omakeylight-ctl: %s\n' "$*" >&2; exit 1; }
+
+# Pick the keyboard-backlight LED. Vendors name it differently
+# (dell::, tpacpi::, asus::, smc::, apple::), so match on the suffix.
+find_device() {
+  if [[ -n ${OMAKEYLIGHT_DEVICE:-} ]]; then
+    [[ -d $LEDS_DIR/$OMAKEYLIGHT_DEVICE ]] || die "no such LED: $OMAKEYLIGHT_DEVICE"
+    printf '%s\n' "$OMAKEYLIGHT_DEVICE"
+    return 0
+  fi
+  local d name
+  for d in "$LEDS_DIR"/*kbd_backlight "$LEDS_DIR"/*kbd_light "$LEDS_DIR"/*::backlight; do
+    [[ -d $d ]] || continue
+    name=${d##*/}
+    printf '%s\n' "$name"
+    return 0
+  done
+  return 1
+}
+
+DEVICE=$(find_device) || DEVICE=""
+DEV_PATH="$LEDS_DIR/$DEVICE"
+
+require_device() {
+  [[ -n $DEVICE ]] || die "no keyboard backlight found under $LEDS_DIR"
+}
+
+read_attr() { [[ -r $DEV_PATH/$1 ]] && tr -d '\n' < "$DEV_PATH/$1" || printf ''; }
+
+max_brightness() {
+  local m; m=$(read_attr max_brightness)
+  [[ $m =~ ^[0-9]+$ ]] && printf '%s\n' "$m" || printf '1\n'
+}
+
+timeout_writable() { [[ -w $DEV_PATH/stop_timeout ]]; }
+has_timeout()      { [[ -e $DEV_PATH/stop_timeout ]]; }
+
+# --- brightness -------------------------------------------------------------
+
+set_brightness() {
+  local target=$1 max cur
+  max=$(max_brightness)
+  cur=$(read_attr brightness); cur=${cur:-0}
+
+  case $target in
+    +*|-*) target=$(( cur + target )) ;;
+    max)   target=$max ;;
+    off)   target=0 ;;
+  esac
+  [[ $target =~ ^-?[0-9]+$ ]] || die "brightness: expected a number, 'off' or 'max', got '$target'"
+  (( target < 0 )) && target=0
+  (( target > max )) && target=$max
+
+  # Remember the last lit level so `toggle` has something to restore.
+  if (( target > 0 )); then
+    mkdir -p "$CACHE_DIR" 2>/dev/null
+    printf '%s\n' "$target" > "$CACHE_DIR/last-$DEVICE" 2>/dev/null
+  fi
+
+  if command -v brightnessctl >/dev/null 2>&1; then
+    brightnessctl --device="$DEVICE" --class=leds set "$target" >/dev/null 2>&1 && return 0
+  fi
+  # Fallback for systems without brightnessctl or without a logind session.
+  printf '%s\n' "$target" > "$DEV_PATH/brightness" 2>/dev/null && return 0
+  die "cannot set brightness (no brightnessctl, and $DEV_PATH/brightness is not writable)"
+}
+
+toggle_brightness() {
+  local cur last
+  cur=$(read_attr brightness); cur=${cur:-0}
+  if (( cur > 0 )); then
+    set_brightness 0
+  else
+    last=$(cat "$CACHE_DIR/last-$DEVICE" 2>/dev/null)
+    [[ $last =~ ^[0-9]+$ ]] && (( last > 0 )) || last=$(max_brightness)
+    set_brightness "$last"
+  fi
+}
+
+# --- timeout ----------------------------------------------------------------
+
+set_timeout() {
+  local value=$1
+  has_timeout || die "this keyboard backlight has no stop_timeout attribute"
+  timeout_writable || die "stop_timeout is not writable — run install.sh to add the udev rule"
+  if ! printf '%s\n' "$value" > "$DEV_PATH/stop_timeout" 2>/dev/null; then
+    forget_timeout "$value"
+    die "driver rejected timeout '$value' (supported: $(supported_timeouts))"
+  fi
+}
+
+# Probe once per device: try each candidate, keep the ones the driver accepts,
+# then restore whatever was set before. This writes to the hardware, so it runs
+# only when asked for explicitly (install.sh, or `omakeylight-ctl probe`) and
+# never from the status path — two concurrent status polls probing at once
+# would race each other into leaving a random delay behind.
+probe_timeouts() {
+  has_timeout || return 1
+  timeout_writable || return 1
+  mkdir -p "$CACHE_DIR" 2>/dev/null || return 1
+
+  # One prober at a time, so a second caller waits rather than interleaving
+  # its writes with ours and corrupting the restore.
+  exec 9>"$CACHE_DIR/probe.lock" || return 1
+  flock 9 || return 1
+
+  local original accepted=() v
+  original=$(read_attr stop_timeout)
+  for v in "${CANDIDATE_TIMEOUTS[@]}"; do
+    if printf '%s\n' "$v" > "$DEV_PATH/stop_timeout" 2>/dev/null; then
+      accepted+=("$v")
+    fi
+  done
+  # Put the user's delay back before anything else observes the probe.
+  if [[ -n $original ]]; then
+    printf '%s\n' "$original" > "$DEV_PATH/stop_timeout" 2>/dev/null
+  fi
+  flock -u 9
+
+  (( ${#accepted[@]} )) || return 1
+  printf '%s\n' "${accepted[*]}" > "$CACHE_DIR/timeouts-$DEVICE" 2>/dev/null
+  printf '%s\n' "${accepted[*]}"
+}
+
+# Read-only: never probes. Falls back to the unverified candidate list so the
+# panel has buttons to show on a machine where probe has not run yet; a value
+# the driver rejects gets pruned by set_timeout below.
+supported_timeouts() {
+  local cached="$CACHE_DIR/timeouts-$DEVICE"
+  if [[ -s $cached ]]; then
+    tr -d '\n' < "$cached"
+    return 0
+  fi
+  printf '%s' "${CANDIDATE_TIMEOUTS[*]}"
+}
+
+# Drop a delay the driver refused, so the panel stops offering it.
+forget_timeout() {
+  local cached="$CACHE_DIR/timeouts-$DEVICE" kept=() v
+  for v in $(supported_timeouts); do
+    [[ $v == "$1" ]] || kept+=("$v")
+  done
+  mkdir -p "$CACHE_DIR" 2>/dev/null || return 0
+  printf '%s\n' "${kept[*]}" > "$cached" 2>/dev/null
+}
+
+# --- output -----------------------------------------------------------------
+
+status() {
+  require_device
+  printf 'device\t%s\n'          "$DEVICE"
+  printf 'brightness\t%s\n'      "$(read_attr brightness)"
+  printf 'max\t%s\n'             "$(max_brightness)"
+  if has_timeout; then
+    printf 'timeout\t%s\n'         "$(read_attr stop_timeout)"
+    printf 'timeoutWritable\t%s\n' "$(timeout_writable && echo 1 || echo 0)"
+    printf 'timeouts\t%s\n'        "$(supported_timeouts)"
+  else
+    printf 'timeoutWritable\t0\n'
+    printf 'timeouts\t\n'
+  fi
+}
+
+usage() {
+  cat <<'USAGE'
+omakeylight-ctl — keyboard backlight brightness and timeout
+
+  status              Print current state as tab-separated key/value lines
+  brightness <n>      Set brightness (0..max, or +1 / -1 / off / max)
+  toggle              Turn off, or restore the last lit level
+  timeout <value>     Set the auto-off delay (e.g. 10s, 1m, 5m)
+  timeouts            List the delays this driver accepts
+  probe               Re-detect accepted delays and refresh the cache
+  device              Print the detected LED device name
+USAGE
+}
+
+case ${1:-status} in
+  status)     status ;;
+  brightness) require_device; [[ $# -ge 2 ]] || die "brightness: missing value"; set_brightness "$2" ;;
+  toggle)     require_device; toggle_brightness ;;
+  timeout)    require_device; [[ $# -ge 2 ]] || die "timeout: missing value"; set_timeout "$2" ;;
+  timeouts)   require_device; supported_timeouts; echo ;;
+  probe)      require_device; rm -f "$CACHE_DIR/timeouts-$DEVICE"; probe_timeouts || die "probing failed (timeout not writable?)" ;;
+  device)     require_device; printf '%s\n' "$DEVICE" ;;
+  -h|--help|help) usage ;;
+  *)          usage >&2; exit 1 ;;
+esac
